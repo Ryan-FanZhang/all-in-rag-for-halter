@@ -4,5 +4,6 @@ __pycache__/
 .env
 chroma_db/
 data/images/
+logs/
 *.log
 

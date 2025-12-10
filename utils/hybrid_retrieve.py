@@ -292,17 +292,30 @@ def main() -> None:
     chunk_ids = [cid for cid, _ in collected]
     context_chunks = [txt for _, txt in collected]
 
-    print(f"\nQuery: {args.query}")
-    print(f"Dense hits: {len(dense_hits)}, Sparse hits: {len(sparse_hits)}, Fused: {len(fused)}, Reranked: {len(reranked)}")
+    def safe_print(text: str):
+        """Print text safely, replacing chars that console encoding cannot handle."""
+        import sys
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            # Get console encoding (e.g., 'gbk' on Windows, 'utf-8' on Linux)
+            console_encoding = sys.stdout.encoding or "utf-8"
+            # Encode to console encoding, replacing problematic chars with '?'
+            safe_bytes = text.encode(console_encoding, errors="replace")
+            safe_text = safe_bytes.decode(console_encoding)
+            print(safe_text)
+
+    safe_print(f"\nQuery: {args.query}")
+    safe_print(f"Dense hits: {len(dense_hits)}, Sparse hits: {len(sparse_hits)}, Fused: {len(fused)}, Reranked: {len(reranked)}")
     for i, (_id, sc, meta, doc) in enumerate(reranked, start=1):
         src = meta.get("source", "")
         sec = meta.get("section_path", "")
-        print(f"\n#{i} score={sc:.4f} source={src} section={sec}")
-        print(doc[:400].replace("\n", " "))
+        safe_print(f"\n#{i} score={sc:.4f} source={src} section={sec}")
+        safe_print(doc[:400].replace("\n", " "))
 
-    print("\nContext for LLM (neighbor-augmented, token-limited):")
+    safe_print("\nContext for LLM (neighbor-augmented, token-limited):")
     for i, (cid, chunk) in enumerate(zip(chunk_ids, context_chunks), start=1):
-        print(f"\n[CTX {i}] chunk_id={cid} {chunk[:400].replace(chr(10), ' ')}")
+        safe_print(f"\n[CTX {i}] chunk_id={cid} {chunk[:400].replace(chr(10), ' ')}")
 
     if not args.no_llm:
         # First-pass answer
@@ -314,16 +327,66 @@ def main() -> None:
         )
         resp = generate_answer(messages)
         answer_text = resp.content
-        print("\nLLM Answer (raw):\n")
-        print(answer_text)
+        safe_print("\nLLM Answer (raw):\n")
+        safe_print(answer_text)
 
         # Judge pass
         judge_messages = build_messages_judge(
             args.query, context_chunks, chunk_ids, answer_text, language="English"
         )
         judge_resp = generate_answer(judge_messages)
-        print("\nJudge:\n")
-        print(judge_resp.content)
+        safe_print("\nJudge:\n")
+        safe_print(judge_resp.content)
+        
+        # Parse LLM answer and Judge, then output final JSON
+        try:
+            # Try to parse LLM answer as JSON
+            answer_json = json.loads(answer_text)
+            can_answer = answer_json.get("can_answer", True)
+            confidence = answer_json.get("confidence", 0.5)
+            answer = answer_json.get("answer", answer_text)
+            reason = answer_json.get("reason", "")
+            sources = answer_json.get("sources", chunk_ids)
+        except json.JSONDecodeError:
+            # Fallback: treat as plain text answer
+            can_answer = True
+            confidence = 0.7
+            answer = answer_text
+            reason = "Plain text answer"
+            sources = chunk_ids
+        
+        # Try to parse Judge
+        try:
+            judge_json = json.loads(judge_resp.content)
+            is_supported = judge_json.get("is_supported", True)
+            hallucination_level = judge_json.get("hallucination_level", 0)
+            judge_confidence = judge_json.get("overall_confidence", confidence)
+            
+            # If Judge says not supported or high hallucination, override
+            if not is_supported or hallucination_level >= 1:
+                can_answer = False
+                confidence = min(confidence, judge_confidence)
+                reason = judge_json.get("comment", "Judge detected issues")
+        except json.JSONDecodeError:
+            pass  # Keep original answer
+        
+        # Output final JSON result for rag_tool to parse
+        final_result = {
+            "can_answer": can_answer,
+            "confidence": confidence,
+            "answer": answer,
+            "reason": reason,
+            "sources": sources,
+            "retrieval_scores": {
+                "top1": top1,
+                "avg_top5": avg_top5,
+                "hits": len(reranked)
+            }
+        }
+        safe_print("\n" + "="*80)
+        safe_print("FINAL_JSON_RESULT:")
+        safe_print(json.dumps(final_result, ensure_ascii=False))
+        safe_print("="*80)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,8 @@ if str(ROOT) not in sys.path:
 
 from tools.rag_tool import create_rag_tool
 from tools.escalate_tool import create_escalate_tool
+from tools.api_tool import create_api_tool
+from utils.memory_manager import create_memory_manager
 
 # Load environment variables
 load_dotenv()
@@ -217,11 +219,21 @@ def main():
         st.markdown("---")
         if st.button("🗑️ Clear Chat History"):
             st.session_state.messages = []
+            if "memory" in st.session_state:
+                st.session_state.memory.clear()
             st.rerun()
+        
+        # Show memory summary in sidebar
+        if "memory" in st.session_state and st.session_state.messages:
+            with st.expander("💭 Memory Summary"):
+                st.text(st.session_state.memory.get_summary())
     
-    # Initialize chat history
+    # Initialize chat history and memory
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    
+    if "memory" not in st.session_state:
+        st.session_state.memory = create_memory_manager(window_size=5)
     
     # Display chat history
     for message in st.session_state.messages:
@@ -253,21 +265,27 @@ def main():
                 unsafe_allow_html=True
             )
             
-            # Show sources if available
+            # Show sources if available (for RAG)
             if metadata.get("sources"):
                 with st.expander("📚 View Sources"):
                     st.json(metadata["sources"])
+            
+            # Show raw API data if available (for API calls)
+            if metadata.get("raw_json"):
+                with st.expander("📄 View Raw API Response"):
+                    st.code(metadata["raw_json"], language="json")
     
     # Chat input
     user_query = st.chat_input("Ask me anything about your coffee machine...")
     
     if user_query:
-        # Add user message to history
+        # Add user message to history and memory
         st.session_state.messages.append({
             "role": "user",
             "content": user_query,
             "timestamp": datetime.now().isoformat()
         })
+        st.session_state.memory.add_user_message(user_query)
         
         # Show user message
         st.markdown(f'<div class="chat-message user-message"><strong>You:</strong><br>{user_query}</div>', unsafe_allow_html=True)
@@ -423,21 +441,82 @@ def main():
                     except json.JSONDecodeError:
                         response_content = escalate_result_str
             
-            elif action in ["db", "api"]:
-                response_content = f"The '{action}' action is not yet implemented. Please contact support for assistance."
+            elif action == "api":
+                # Use API tool
+                api_tool = create_api_tool(mock_delay=0.3)
+                with st.spinner("📡 Calling external API..."):
+                    # Try to extract query type from user query
+                    api_result_str = api_tool._run(user_query)
+                    
+                    try:
+                        api_result = json.loads(api_result_str)
+                        
+                        if api_result.get("status") == "success":
+                            data = api_result.get("data", {})
+                            query_type = api_result.get("query_type", "unknown")
+                            
+                            # Use LLM to summarize the API response with conversation context
+                            with st.spinner("🤖 Generating summary..."):
+                                from langchain_openai import ChatOpenAI
+                                
+                                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+                                
+                                summary_system_prompt = (
+                                    "You are a helpful assistant that summarizes API responses. "
+                                    "Given the conversation history, user's current question, and API data, "
+                                    "provide a clear, natural language summary that directly answers the question. "
+                                    "Consider the conversation context for follow-up questions. "
+                                    "Be concise but include all important details. Use a friendly tone."
+                                )
+                                
+                                current_query_with_data = (
+                                    f"API Response Type: {query_type}\n\n"
+                                    f"API Data:\n{json.dumps(data, indent=2, ensure_ascii=False)}\n\n"
+                                    f"Current Question: {user_query}\n\n"
+                                    f"Please summarize this information in a natural, user-friendly way, "
+                                    f"considering the conversation context above."
+                                )
+                                
+                                # Get messages with conversation history
+                                messages = st.session_state.memory.get_context_for_llm(
+                                    current_query=current_query_with_data,
+                                    system_prompt=summary_system_prompt
+                                )
+                                
+                                summary_resp = llm.invoke(messages)
+                                response_content = summary_resp.content
+                                
+                            response_metadata["api_data"] = data
+                            response_metadata["query_type"] = query_type
+                            response_metadata["summary_mode"] = True
+                            
+                            # Store raw JSON for expandable view
+                            response_metadata["raw_json"] = json.dumps(data, indent=2, ensure_ascii=False)
+                        else:
+                            response_content = f"**API Error:** {api_result.get('message', 'Unknown error')}"
+                            response_metadata["error"] = True
+                    
+                    except json.JSONDecodeError:
+                        response_content = f"Error parsing API response: {api_result_str[:500]}"
+                        response_metadata["error"] = True
+            
+            elif action == "db":
+                # Database query not yet implemented
+                response_content = "The 'db' action is not yet implemented. Please contact support for assistance."
                 response_metadata["action"] = "escalate"
             
             else:
                 response_content = "Unknown action. Please contact support."
                 response_metadata["error"] = True
         
-        # Add assistant response to history
+        # Add assistant response to history and memory
         st.session_state.messages.append({
             "role": "assistant",
             "content": response_content,
             "metadata": response_metadata,
             "timestamp": datetime.now().isoformat()
         })
+        st.session_state.memory.add_ai_message(response_content, metadata=response_metadata)
         
         # Rerun to show the new message
         st.rerun()

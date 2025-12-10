@@ -71,14 +71,54 @@ def parse_signals(raw: str) -> dict:
 
 def build_router_messages(query: str, retrieval_signals: dict) -> List[dict]:
     system_text = (
-        "You are a routing assistant. Decide the best action for the user query.\n"
-        "Possible actions: rag, escalate, db, api.\n"
-        "Use the numeric rules first; do NOT override them. Only if no rule is met, reason with intent.\n"
-        "Adjusted Rules (more lenient for RAG):\n"
-        "- If top1>=0.5 AND avg_top5>=0.35 AND hits>=3 then action=rag, confidence=0.9.\n"
-        "- If top1<0.25 OR avg_top5<0.20 OR hits<2 then action=escalate, confidence=0.9.\n"
-        "- Otherwise, if troubleshooting/product intro/how-to -> rag (confidence 0.7); safety/compliance/unsupported -> escalate (0.8);\n"
-        "  explicit DB lookup -> db (0.8); external service status -> api (0.8).\n"
+        "You are a routing assistant for a coffee machine support system. Decide the best action for the user query.\n"
+        "Possible actions: rag, escalate, db, api.\n\n"
+        
+        "## Hard Rules (ALWAYS apply these first):\n"
+        "1. If top1>=0.5 AND avg_top5>=0.35 AND hits>=3 → action=rag, confidence=0.9\n"
+        "2. If top1<0.15 OR avg_top5<0.10 OR hits<2 → action=escalate, confidence=0.9\n"
+        "3. Otherwise, use intent-based routing below (PRIORITIZE API for order/inventory/price queries)\n\n"
+        
+        "## Intent-Based Routing (if hard rules don't apply):\n\n"
+        
+        "### API (confidence=0.85) - Use when query asks for LIVE/REAL-TIME data:\n"
+        "**Trigger keywords**: order, status, tracking, inventory, stock, availability, price, shipping, delivery, service status, uptime, payment, transaction\n"
+        "**Examples**:\n"
+        "- 'check my order ORD12345' → api\n"
+        "- 'what is my order status' → api\n"
+        "- 'is the coffee machine in stock' → api\n"
+        "- 'check inventory' → api\n"
+        "- 'how much does it cost' → api (real-time price)\n"
+        "- 'what is the service status' → api\n"
+        "- 'track my shipment' → api\n\n"
+        
+        "### RAG (confidence=0.75) - Use for STATIC knowledge from manuals:\n"
+        "**Trigger keywords**: how to, troubleshoot, fix, problem, issue, manual, guide, instructions, features, specifications\n"
+        "**Examples**:\n"
+        "- 'my coffee is not hot' → rag (troubleshooting)\n"
+        "- 'how to clean the machine' → rag (instructions)\n"
+        "- 'what does the red light mean' → rag (manual)\n"
+        "- 'how to adjust grinder' → rag (how-to)\n\n"
+        
+        "### ESCALATE (confidence=0.85) - Use when cannot be handled:\n"
+        "**Trigger keywords**: complaint, refund, warranty claim, legal, safety concern, human agent, speak to someone\n"
+        "**Examples**:\n"
+        "- 'I want a refund' → escalate\n"
+        "- 'this is unacceptable' → escalate\n"
+        "- 'connect me to support' → escalate\n\n"
+        
+        "### DB (confidence=0.80) - Use for structured data lookups:\n"
+        "**Examples**: customer records, purchase history, warranty records (not implemented yet)\n\n"
+        
+        "## Decision Priority:\n"
+        "1. Check hard rules first (retrieval scores)\n"
+        "2. **HIGHEST PRIORITY**: If query contains API keywords (order/status/tracking/inventory/stock/price) → api\n"
+        "3. If query is about product usage/troubleshooting → rag\n"
+        "4. If query needs human intervention → escalate\n\n"
+        "**CRITICAL**: Queries about orders, inventory, prices, or service status should ALWAYS use 'api', "
+        "even if retrieval scores are low. Low retrieval scores for such queries are EXPECTED because this "
+        "information is not in the knowledge base.\n\n"
+        
         "Respond ONLY in JSON: {\"action\": \"rag|escalate|db|api\", \"confidence\": 0.0-1.0, \"reason\": \"...\"}"
     )
     user_text = (
@@ -131,13 +171,16 @@ def main() -> None:
     }
     print(json.dumps({"debug_signals": debug_info}, ensure_ascii=False))
 
-    # Adjusted rules: more lenient for RAG
+    # Adjusted rules: more lenient for RAG, stricter for escalate
     if top1 >= 0.5 and avg5 >= 0.35 and hits >= 3:
         result = {"action": "rag", "confidence": 0.9, "reason": "High retrieval scores (relaxed threshold)"}
         print(json.dumps(result, ensure_ascii=False))
         return
-    if top1 < 0.25 or avg5 < 0.20 or hits < 2:
-        result = {"action": "escalate", "confidence": 0.9, "reason": "Very low retrieval scores"}
+    
+    # IMPORTANT: Only escalate on extremely low scores
+    # For API queries (order/inventory/price), let LLM decide even if scores are low
+    if top1 < 0.15 or avg5 < 0.10 or hits < 2:
+        result = {"action": "escalate", "confidence": 0.9, "reason": "Extremely low retrieval scores"}
         print(json.dumps(result, ensure_ascii=False))
         return
 
